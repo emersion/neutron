@@ -2,6 +2,7 @@ package imap
 
 import (
 	"errors"
+	"log"
 
 	"github.com/emersion/neutron/backend"
 )
@@ -12,6 +13,28 @@ type Users struct {
 	*conns
 
 	users map[string]*backend.User
+}
+
+func (b *Users) getQuota(user *backend.User) (err error) {
+	c, unlock, err := b.getConn(user.ID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+
+	if !c.Caps["QUOTA"] {
+		// Quotas not supported on this server
+		return nil
+	}
+
+	_, _, err = wait(c.GetQuotaRoot("INBOX"))
+	if err != nil {
+		return
+	}
+
+	// TODO
+
+	return
 }
 
 func (b *Users) GetUser(id string) (user *backend.User, err error) {
@@ -55,6 +78,8 @@ func (b *Users) Auth(username, password string) (user *backend.User, err error) 
 			},
 		},
 	}
+
+	b.getQuota(user)
 
 	b.users[user.ID] = user
 
