@@ -41,7 +41,14 @@ func (b *conns) connect(username, password string) (email string, err error) {
 		return
 	}
 
+	//c.SetLogMask(imap.LogAll)
+
 	if !b.config.Tls {
+		if !c.Caps["STARTTLS"] {
+			err = errors.New("IMAP server doesn't support STARTTLS")
+			return
+		}
+
 		_, err = c.StartTLS(nil)
 		if err != nil {
 			return

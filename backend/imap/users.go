@@ -2,7 +2,6 @@ package imap
 
 import (
 	"errors"
-	"log"
 
 	"github.com/emersion/neutron/backend"
 )
@@ -27,12 +26,27 @@ func (b *Users) getQuota(user *backend.User) (err error) {
 		return nil
 	}
 
-	_, _, err = wait(c.GetQuotaRoot("INBOX"))
+	cmd, _, err := wait(c.GetQuotaRoot("INBOX"))
 	if err != nil {
 		return
 	}
 
-	// TODO
+	// TODO: support multiple quotas?
+	for _, res := range cmd.Data {
+		if res.Label != "QUOTA" {
+			continue
+		}
+
+		_, quotas := res.Quota()
+		if len(quotas) == 0 {
+			continue
+		}
+		quota := quotas[0]
+
+		user.UsedSpace = int(quota.Usage) * 1024
+		user.MaxSpace = int(quota.Limit) * 1024
+		break
+	}
 
 	return
 }
