@@ -245,6 +245,7 @@ func New(m *macaron.Macaron, backend *backend.Backend) {
 		m.Get("/plans", api.GetPlans)
 		m.Get("/subscription", api.GetSubscription)
 		m.Get("/methods", api.GetPaymentMethods)
+		m.Get("/invoices", api.GetInvoices)
 	})
 
 	m.Get("/organizations", api.GetUserOrganization)

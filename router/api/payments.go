@@ -30,10 +30,20 @@ func (api *Api) GetPlans(ctx *macaron.Context) {
 	})
 }
 
+type Subscription struct {
+	Plan
+	Plans []*Plan
+}
+
+type SubscriptionResp struct {
+	Resp
+	Subscription *Subscription
+}
+
 func (api *Api) GetSubscription(ctx *macaron.Context) {
-	ctx.JSON(200, &ErrorResp{
-		Resp: Resp{22110},
-		Error: "You do not have an active subscription",
+	ctx.JSON(200, &SubscriptionResp{
+		Resp: Resp{Ok},
+		Subscription: &Subscription{},
 	})
 }
 
@@ -46,5 +56,17 @@ func (api *Api) GetPaymentMethods(ctx *macaron.Context) {
 	ctx.JSON(200, &PaymentMethodsResp{
 		Resp: Resp{Ok},
 		PaymentMethods: []interface{}{},
+	})
+}
+
+type InvoicesResp struct {
+	Resp
+	Invoices []interface{} // TODO
+}
+
+func (api *Api) GetInvoices(ctx *macaron.Context) {
+	ctx.JSON(200, &InvoicesResp{
+		Resp: Resp{Ok},
+		Invoices: []interface{}{},
 	})
 }
