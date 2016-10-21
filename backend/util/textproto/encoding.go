@@ -46,3 +46,15 @@ func decodeContentEncoding(r io.Reader, contentEncoding string) io.Reader {
 	}
 	return r
 }
+
+func Decode(r io.Reader, encoding, charset string) io.Reader {
+	if encoding != "" {
+		r = decodeContentEncoding(r, encoding)
+	}
+
+	if charset != "" {
+		r = decodeCharset(r, charset)
+	}
+
+	return r
+}

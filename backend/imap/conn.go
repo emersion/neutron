@@ -8,13 +8,16 @@ import (
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
 	imapidle "github.com/emersion/go-imap-idle"
+	imapquota "github.com/emersion/go-imap-quota"
 )
 
 type idleClient struct {*imapidle.Client}
+type quotaClient struct {*imapquota.Client}
 
 type conn struct {
 	*imapclient.Client
 	idleClient
+	quotaClient
 }
 
 type client struct {
@@ -66,6 +69,7 @@ func (b *conns) connect(username, password string) (email string, err error) {
 		conn: &conn{
 			Client: c,
 			idleClient: idleClient{imapidle.NewClient(c)},
+			quotaClient: quotaClient{imapquota.NewClient(c)},
 		},
 		lock: &sync.Mutex{},
 		password: password,

@@ -6,11 +6,11 @@ import (
 	"encoding/base64"
 	"net/mail"
 	"net/textproto"
-	"mime"
+	//"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
-	"strings"
-	"io"
+	//"strings"
+	//"io"
 
 	"github.com/emersion/neutron/backend"
 	"github.com/emersion/neutron/backend/util/textproto/chunksplit"
@@ -56,7 +56,7 @@ func ParseMessageHeader(msg *backend.Message, header *mail.Header) {
 	}
 }
 
-func ParseMessagePart(header textproto.MIMEHeader, body io.Reader) (structure *BodyStructure, err error) {
+/*func ParseMessagePart(header textproto.MIMEHeader, body io.Reader) (structure *BodyStructure, err error) {
 	mediaType, params, err := mime.ParseMediaType(header.Get("Content-Type"))
 	if err != nil {
 		return
@@ -103,7 +103,7 @@ func ParseMessagePart(header textproto.MIMEHeader, body io.Reader) (structure *B
 	}
 
 	return
-}
+}*/
 
 
 func formatMessage(header textproto.MIMEHeader, body string) string {
