@@ -8,7 +8,7 @@ import (
 
 func getLabelID(mailbox string) string {
 	lbl := mailbox
-	switch lbl {
+	switch mailbox {
 	case "INBOX":
 		lbl = backend.InboxLabel
 	case "Draft", "Drafts":
@@ -102,8 +102,7 @@ func (b *Labels) InsertLabel(user string, label *backend.Label) (inserted *backe
 	}
 	defer unlock()
 
-	_, _, err = wait(c.Create(label.Name))
-	if err != nil {
+	if err = c.Create(label.Name); err != nil {
 		return
 	}
 
@@ -130,8 +129,7 @@ func (b *Labels) UpdateLabel(user string, update *backend.LabelUpdate) (label *b
 	}
 	defer unlock()
 
-	_, _, err = wait(c.Rename(label.ID, label.Name))
-	if err != nil {
+	if err = c.Rename(label.ID, label.Name); err != nil {
 		return
 	}
 
@@ -142,15 +140,14 @@ func (b *Labels) UpdateLabel(user string, update *backend.LabelUpdate) (label *b
 	return
 }
 
-func (b *Labels) DeleteLabel(user, id string) (err error) {
-	err = b.selectMailbox(user, id)
-	if err != nil {
-		return
+func (b *Labels) DeleteLabel(user, id string) error {
+	if err := b.selectMailbox(user, id); err != nil {
+		return err
 	}
 
 	c, unlock, err := b.getConn(user)
 	if err != nil {
-		return
+		return err
 	}
 	defer unlock()
 
@@ -158,15 +155,13 @@ func (b *Labels) DeleteLabel(user, id string) (err error) {
 		return errors.New("This label contains mesages, please move all of them before deleting it")
 	}
 
-	_, _, err = wait(c.Delete(id))
-	if err != nil {
-		return
+	if err := c.Delete(id); err != nil {
+		return err
 	}
 
 	// Refresh mailbox list
 	b.clients[user].mailboxes = nil
-
-	return
+	return nil
 }
 
 func newLabels(conns *conns) *Labels {

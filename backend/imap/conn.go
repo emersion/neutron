@@ -5,14 +5,23 @@ import (
 	"errors"
 	"time"
 
-	"github.com/mxk/go-imap/imap"
+	"github.com/emersion/go-imap"
+	imapclient "github.com/emersion/go-imap/client"
+	imapidle "github.com/emersion/go-imap-idle"
 )
+
+type idleClient struct {*imapidle.Client}
+
+type conn struct {
+	*imapclient.Client
+	idleClient
+}
 
 type client struct {
 	id string
-	conn *imap.Client
+	conn *conn
 	lock sync.Locker
-	idle bool
+	idle chan struct{}
 	idleTimer *time.Timer
 	password string
 	mailboxes []*imap.MailboxInfo
@@ -31,39 +40,33 @@ type conns struct {
 }
 
 func (b *conns) connect(username, password string) (email string, err error) {
-	var c *imap.Client
+	var c *imapclient.Client
 	if b.config.Tls {
-		c, err = imap.DialTLS(b.config.Host(), nil)
+		c, err = imapclient.DialTLS(b.config.Host(), nil)
 	} else {
-		c, err = imap.Dial(b.config.Host())
+		c, err = imapclient.Dial(b.config.Host())
 	}
 	if err != nil {
 		return
 	}
 
-	//c.SetLogMask(imap.LogAll)
-
 	if !b.config.Tls {
-		if !c.Caps["STARTTLS"] {
-			err = errors.New("IMAP server doesn't support STARTTLS")
-			return
-		}
-
-		_, err = c.StartTLS(nil)
-		if err != nil {
+		if err = c.StartTLS(nil); err != nil {
 			return
 		}
 	}
 
 	email = username + b.config.Suffix
-	_, err = c.Login(email, password)
-	if err != nil {
+	if err = c.Login(email, password); err != nil {
 		return
 	}
 
 	b.clients[username] = &client{
 		id: username,
-		conn: c,
+		conn: &conn{
+			Client: c,
+			idleClient: idleClient{imapidle.NewClient(c)},
+		},
 		lock: &sync.Mutex{},
 		password: password,
 	}
@@ -77,8 +80,7 @@ func (b *conns) disconnect(user string) error {
 	}
 	defer unlock()
 
-	_, err = c.Close(false)
-	if err != nil {
+	if err := c.Close(); err != nil {
 		return err
 	}
 
@@ -86,7 +88,7 @@ func (b *conns) disconnect(user string) error {
 	return nil
 }
 
-func (b *conns) getConn(user string) (*imap.Client, func(), error) {
+func (b *conns) getConn(user string) (*conn, func(), error) {
 	clt, ok := b.clients[user]
 	if !ok {
 		return nil, nil, errors.New("No such user")
@@ -96,13 +98,11 @@ func (b *conns) getConn(user string) (*imap.Client, func(), error) {
 
 	lock.Lock()
 
-	state := c.State()
-	if state == imap.Logout || state == imap.Closed {
+	if c.State & imap.ConnectedState == 0 {
 		delete(b.clients, user)
 
 		// Connection closed, reconnect
-		_, err := b.connect(user, clt.password)
-		if err != nil {
+		if _, err := b.connect(user, clt.password); err != nil {
 			delete(b.clients, user)
 			lock.Unlock()
 			return nil, nil, err
@@ -126,7 +126,7 @@ func (b *conns) getConn(user string) (*imap.Client, func(), error) {
 }
 
 func (b *conns) scheduleIdle(clt *client) {
-	if clt.idle {
+	if clt.idle != nil {
 		return
 	}
 
@@ -140,7 +140,7 @@ func (b *conns) scheduleIdle(clt *client) {
 }
 
 func (b *conns) idle(clt *client) error {
-	if clt.idle {
+	if clt.idle != nil {
 		return nil
 	}
 
@@ -148,98 +148,69 @@ func (b *conns) idle(clt *client) error {
 
 	mailbox := "INBOX"
 	if c.Mailbox != nil && c.Mailbox.Name != mailbox {
-		_, err := c.Select(mailbox, false)
-		if err != nil {
+		if _, err := c.Select(mailbox, false); err != nil {
 			return err
 		}
 	}
 
-	_, err := c.Idle()
-	if err != nil {
-		return err
-	}
+	clt.lock.Lock()
+	defer clt.lock.Unlock()
 
-	clt.idle = true
+	done := make(chan error, 1)
+	clt.idle = make(chan struct{})
+	go func() {
+		done <- c.Idle(clt.idle)
+	}()
 
 	reset := time.After(20 * time.Minute)
 
 	for {
 		select {
-		case <-time.After(10 * time.Second):
-			// Client stopped idling
-			if !clt.idle {
-				return nil
+		case status := <-c.MailboxUpdates:
+			u := &update{
+				user: clt.id,
+				name: "EXISTS",
+				seqnbr: status.Messages,
 			}
 
-			clt.lock.Lock()
-
-			err = c.Recv(0)
-			if err == imap.ErrTimeout {
-				// Nothing was received
-				clt.lock.Unlock()
-				break
+			select {
+			case b.updates <- u:
+			default:
 			}
-			if err != nil {
-				clt.lock.Unlock()
-				return err
+		case seqNum := <-c.Expunges:
+			u := &update{
+				user: clt.id,
+				name: "EXPUNGE",
+				seqnbr: seqNum,
 			}
 
-			// Copy data
-			data := []*imap.Response{}
-			data = append(data, c.Data...)
-			c.Data = nil
-
-			clt.lock.Unlock()
-
-			for _, res := range data {
-				if res.Type != imap.Data {
-					continue
-				}
-				if len(res.Fields) != 2 {
-					continue
-				}
-
-				// Send update (non-blocking)
-				u := &update{
-					user: clt.id,
-					name: imap.AsString(res.Fields[1]),
-					seqnbr: imap.AsNumber(res.Fields[0]),
-				}
-
-				select {
-				case b.updates <- u:
-				default:
-				}
+			select {
+			case b.updates <- u:
+			default:
 			}
+		//case msg := <-c.MessageUpdates:
 		case <-reset:
 			// Reset idle (RFC 2177 recommends 29 min max)
-			err = b.cancelIdle(clt)
-			if err != nil {
+			if err := b.cancelIdle(clt); err != nil {
 				return err
 			}
 
 			return b.idle(clt)
+		case err := <-done:
+			return err
 		}
 	}
-
-	return nil
 }
 
 func (b *conns) cancelIdle(clt *client) error {
-	if !clt.idle {
-		if clt.idleTimer != nil {
-			clt.idleTimer.Stop()
-		}
-		return nil
+	if clt.idleTimer != nil {
+		clt.idleTimer.Stop()
 	}
 
-	c := clt.conn
-
-	_, err := c.IdleTerm()
-	if err != nil {
-		return err
+	if clt.idle != nil {
+		close(clt.idle)
+		clt.idle = nil
 	}
-	clt.idle = false
 
 	return nil
 }
@@ -266,19 +237,18 @@ func (b *conns) getMailboxes(user string) ([]*imap.MailboxInfo, error) {
 		return client.mailboxes, nil
 	}
 
-	cmd, _, err := wait(c.List("", "%"))
-	if err != nil {
-		return nil, err
+	mailboxes := make(chan *imap.MailboxInfo)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.List("", "*", mailboxes)
+	}()
+
+	client.mailboxes = nil
+	for info := range mailboxes {
+		client.mailboxes = append(client.mailboxes, info)
 	}
 
-	// Retrieve mailboxes info and subscribe to them
-	client.mailboxes = make([]*imap.MailboxInfo, len(cmd.Data))
-	for i, rsp := range cmd.Data {
-		mailboxInfo := rsp.MailboxInfo()
-		client.mailboxes[i] = mailboxInfo
-	}
-
-	return client.mailboxes, nil
+	return client.mailboxes, <-done
 }
 
 func (b *conns) getLabelMailbox(user, label string) (mailbox string, err error) {

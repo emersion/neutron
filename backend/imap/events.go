@@ -4,7 +4,7 @@ import (
 	"errors"
 
 	"github.com/emersion/neutron/backend"
-	"github.com/mxk/go-imap/imap"
+	"github.com/emersion/go-imap"
 )
 
 type Events struct {
@@ -40,21 +40,19 @@ func (b *Events) processUpdate(u *update) error {
 	seqset, _ := imap.NewSeqSet("")
 	seqset.AddNum(u.seqnbr)
 
-	cmd, _, err := wait(c.Fetch(seqset, "UID"))
+	ch := make(chan *imap.Message, 1)
+	err = c.Fetch(seqset, []string{imap.UidMsgAttr}, ch)
 	unlock()
 	if err != nil {
 		return err
 	}
 
-	if len(cmd.Data) != 1 {
+	m := <-ch
+	if m == nil {
 		return errors.New("No such message")
 	}
 
-	rsp := cmd.Data[0]
-	msgInfo := rsp.MessageInfo()
-	uid := msgInfo.UID
-
-	msgId := formatMessageId(mailbox, uid)
+	msgId := formatMessageId(mailbox, m.Uid)
 	msg, err := b.msgs.GetMessage(user, msgId)
 	if err != nil {
 		return err

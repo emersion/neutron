@@ -8,10 +8,11 @@ import (
 	"time"
 	"log"
 
+	"github.com/emersion/go-imap"
+
 	"github.com/emersion/neutron/backend"
 	"github.com/emersion/neutron/backend/memory"
 	"github.com/emersion/neutron/backend/util/textproto"
-	"github.com/mxk/go-imap/imap"
 )
 
 type updatableAttachments interface {
@@ -43,25 +44,24 @@ func (b *Messages) GetMessage(user, id string) (msg *backend.Message, err error)
 
 	seqset, _ := imap.NewSeqSet("")
 	seqset.AddNum(uid)
+	items := []string{imap.FlagsMsgAttr, imap.SizeMsgAttr, imap.BodyStructureMsgAttr, "RFC822.HEADER"}
 
 	// Get message metadata
 
-	cmd, _, err := wait(c.UIDFetch(seqset, "FLAGS", "RFC822.SIZE", "RFC822.HEADER", "BODYSTRUCTURE"))
-	if err != nil {
+	ch := make(chan *imap.Message, 1)
+	if err = c.UidFetch(seqset, items, ch); err != nil {
 		return
 	}
 
-	if len(cmd.Data) != 1 {
+	msgInfo := <-ch
+	if msgInfo == nil {
 		err = errors.New("No such message")
 		return
 	}
 
-	rsp := cmd.Data[0]
-	msgInfo := rsp.MessageInfo()
-	structure := parseBodyStructure(imap.AsList(msgInfo.Attrs["BODYSTRUCTURE"]))
+	//structure := parseBodyStructure(imap.AsList(msgInfo.Attrs["BODYSTRUCTURE"]))
 
-	header := imap.AsBytes(msgInfo.Attrs["RFC822.HEADER"])
-	m, err := mail.ReadMessage(bytes.NewReader(header))
+	m, err := mail.ReadMessage(msgInfo.GetBodyPart("RFC822.HEADER"))
 	if err != nil {
 		return
 	}
