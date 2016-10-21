@@ -3,13 +3,13 @@ package imap
 import (
 	"encoding/base64"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/emersion/neutron/backend"
 	"github.com/emersion/neutron/backend/util/textproto"
-	"github.com/mxk/go-imap/imap"
+	"github.com/emersion/go-imap"
 )
 
 func formatAttachmentId(mailbox string, uid uint32, part string) string {
@@ -56,136 +56,110 @@ func parseMessageId(id string) (mailbox string, uid uint32, err error) {
 	return
 }
 
-func parseMessageInfo(msg *backend.Message, msgInfo *imap.MessageInfo) {
-	msg.Order = int(msgInfo.Seq)
-	msg.Size = int(msgInfo.Size)
+func parseMessage(msg *backend.Message, src *imap.Message) {
+	msg.Order = int(src.SeqNum)
+	msg.Size = int(src.Size)
 
-	if msgInfo.Flags["\\Seen"] {
-		msg.IsRead = 1
-	}
-	if msgInfo.Flags["\\Answered"] {
-		msg.IsReplied = 1
-	}
-	if msgInfo.Flags["\\Flagged"] {
-		msg.Starred = 1
-		msg.LabelIDs = append(msg.LabelIDs, backend.StarredLabel)
-	}
-	if msgInfo.Flags["\\Draft"] {
-		msg.Type = backend.DraftType
+	for _, flag := range src.Flags {
+		switch flag {
+		case imap.SeenFlag:
+			msg.IsRead = 1
+		case imap.AnsweredFlag:
+			msg.IsReplied = 1
+		case imap.FlaggedFlag:
+			msg.Starred = 1
+			msg.LabelIDs = append(msg.LabelIDs, backend.StarredLabel)
+		case imap.DraftFlag:
+			msg.Type = backend.DraftType
+		}
 	}
 }
 
-func parseEnvelopeAddress(addr []imap.Field) *backend.Email {
+func bodyStructureAttachments(structure *imap.BodyStructure) []*backend.Attachment {
+	// Non-multipart messages don't contain attachments
+	if structure.MimeType != "multipart" || structure.MimeSubType == "alternative" {
+		return nil
+	}
+
+	var attachments []*backend.Attachment
+	for i, part := range structure.Parts {
+		if part.Type == "multipart" {
+			parseBodyStructure(msg, part)
+			continue
+		}
+
+		// Apple Mail doesn't format well headers
+		// First child is message content
+		if part.Type == "text" && i == 0 {
+			continue
+		}
+
+		attachments = append(attachments, &backend.Attachment{
+			ID: s.Id,
+			Name: s.Params["name"],
+			MIMEType: s.MimeType + "/" + s.MimeSubType,
+			Size: int(s.Size),
+		})
+	}
+
+	return attachments
+}
+
+func getPreferredPart(structure *imap.BodyStructure) (path string, part *imap.BodyStructure) {
+	part = structure
+
+	for i, p := range structure.Parts {
+		if p.MimeType == "multipart" && p.MimeSubType == "alternative" {
+			part, path = getPreferredPart(p)
+			path = strconv.Itoa(i+1) + "." + path
+		}
+		if p.Type != "text" {
+			continue
+		}
+		if part.Type == "multipart" || p.SubType == "html" {
+			part = p
+			path = strconv.Itoa(i+1)
+		}
+	}
+
+	return
+}
+
+func decodePart(part *imap.BodyStructure, r io.Reader) io.Reader {
+	return textproto.Decode(r, part.Encoding, part.Params["charset"])
+}
+
+func parseAddress(addr *imap.Address) *backend.Email {
 	return &backend.Email{
-		Name:    textproto.DecodeWord(imap.AsString(addr[0])),
-		Address: imap.AsString(addr[2]) + "@" + imap.AsString(addr[3]),
+		Name:    textproto.DecodeWord(addr.PersonalName),
+		Address: addr.MailboxName + "@" + addr.HostName,
 	}
 }
 
-func parseEnvelopeAddressList(list []imap.Field) []*backend.Email {
+func parseAddressList(list []*imap.Address) []*backend.Email {
 	emails := make([]*backend.Email, len(list))
-	for i, field := range list {
-		addr := imap.AsList(field)
-		emails[i] = parseEnvelopeAddress(addr)
+	for i, addr := range list {
+		emails[i] = parseAddress(addr)
 	}
 	return emails
 }
 
-func parseEnvelope(msg *backend.Message, envelope []imap.Field) {
-	// TODO: support more formats (see RFC)
-	t, err := time.Parse("Mon, 2 Jan 2006 15:04:05 -0700 (MST)", imap.AsString(envelope[0]))
-	if err != nil {
-		t, err = time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", imap.AsString(envelope[0]))
-	}
-	if err == nil {
-		msg.Time = t.Unix()
+func parseEnvelope(msg *backend.Message, envelope *imap.Envelope) {
+	if !envelope.Date.IsZero() {
+		msg.Time = envelope.Date.Unix()
 	}
 
-	msg.Subject = textproto.DecodeWord(imap.AsString(envelope[1]))
+	msg.Subject = envelope.Subject // textproto.DecodeWord()
 
-	// envelope[2] is From
-
-	senders := imap.AsList(envelope[3])
-	if len(senders) > 0 {
-		msg.Sender = parseEnvelopeAddress(imap.AsList(senders[0]))
+	if len(envelope.Senders) > 0 {
+		msg.Sender = parseAddress(envelope.Senders[0])
 	}
 
-	replyTo := imap.AsList(envelope[4])
-	if len(replyTo) > 0 {
-		msg.ReplyTo = parseEnvelopeAddress(imap.AsList(replyTo[0]))
+	if len(envelope.ReplyTo) > 0 {
+		msg.ReplyTo = parseAddress(envelope.ReplyTo[0])
 	}
 
-	to := imap.AsList(envelope[5])
-	msg.ToList = parseEnvelopeAddressList(to)
-
-	cc := imap.AsList(envelope[6])
-	msg.CCList = parseEnvelopeAddressList(cc)
-
-	bcc := imap.AsList(envelope[6])
-	msg.BCCList = parseEnvelopeAddressList(bcc)
-
-	// envelope[7] is In-Reply-To
-	// envelope[8] is Message-Id
-}
-
-func parseBodyStructureParams(params []imap.Field) map[string]string {
-	result := map[string]string{}
-
-	for i := 0; i < len(params); i += 2 {
-		key := imap.AsString(params[i])
-		val := imap.AsString(params[i+1])
-
-		result[key] = val
-	}
-
-	return result
-}
-
-func parseBodyStructure(structure []imap.Field) *textproto.BodyStructure {
-	var parse func(structure []imap.Field, id string) *textproto.BodyStructure
-	parse = func(structure []imap.Field, id string) *textproto.BodyStructure {
-		if imap.TypeOf(structure[0]) == imap.QuotedString {
-			if id == "" {
-				id = "1"
-			}
-
-			// Not a MIME message
-			return &textproto.BodyStructure{
-				ID:                 id,
-				Type:               imap.AsString(structure[0]),
-				SubType:            imap.AsString(structure[1]),
-				Params:             parseBodyStructureParams(imap.AsList(structure[2])),
-				ContentId:          imap.AsString(structure[3]),
-				ContentDescription: imap.AsString(structure[4]),
-				ContentEncoding:    imap.AsString(structure[5]),
-				Size:               int(imap.AsNumber(structure[6])),
-			}
-		}
-
-		var processedUntil int
-		var children []*textproto.BodyStructure
-		for i, field := range structure {
-			if imap.TypeOf(field) != imap.List {
-				processedUntil = i
-				break
-			}
-
-			childId := strconv.Itoa(i + 1)
-			if id != "" {
-				childId = id + "." + childId
-			}
-
-			child := parse(imap.AsList(field), childId)
-			children = append(children, child)
-		}
-
-		return &textproto.BodyStructure{
-			ID:       id,
-			Type:     "multipart",
-			SubType:  imap.AsString(structure[processedUntil]),
-			Children: children,
-		}
-	}
-
-	return parse(structure, "")
+	msg.ToList = parseAddressList(envelope.To)
+	msg.CCList = parseAddressList(envelope.Cc)
+	msg.BCCList = parseAddressList(envelope.Bcc)
 }

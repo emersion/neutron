@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 	"net/mail"
 	"time"
-	"log"
 
 	"github.com/emersion/go-imap"
 
@@ -25,18 +24,18 @@ type Messages struct {
 	tmpAtts updatableAttachments
 }
 
-func (b *Messages) GetMessage(user, id string) (msg *backend.Message, err error) {
+func (be *Messages) GetMessage(user, id string) (msg *backend.Message, err error) {
 	mailbox, uid, err := parseMessageId(id)
 	if err != nil {
 		return
 	}
 
-	err = b.selectMailbox(user, mailbox)
+	err = be.selectMailbox(user, mailbox)
 	if err != nil {
 		return
 	}
 
-	c, unlock, err := b.getConn(user)
+	c, unlock, err := be.getConn(user)
 	if err != nil {
 		return
 	}
@@ -53,49 +52,53 @@ func (b *Messages) GetMessage(user, id string) (msg *backend.Message, err error)
 		return
 	}
 
-	msgInfo := <-ch
-	if msgInfo == nil {
+	data := <-ch
+	if data == nil {
 		err = errors.New("No such message")
-		return
-	}
-
-	//structure := parseBodyStructure(imap.AsList(msgInfo.Attrs["BODYSTRUCTURE"]))
-
-	m, err := mail.ReadMessage(msgInfo.GetBodyPart("RFC822.HEADER"))
-	if err != nil {
 		return
 	}
 
 	msg = &backend.Message{}
 	msg.ID = id
 	msg.LabelIDs = []string{getLabelID(c.Mailbox.Name)}
-	msg.Header = string(header)
-	parseMessageInfo(msg, msgInfo)
+	//msg.Header = string(header)
+	parseMessage(msg, data)
+
+	// Apply body structure to msg
+	msg.Attachments = bodyStructureAttachments(data.BodyStructure)
+
+	// Apply header to msg
+	m, err := mail.ReadMessage(data.GetBody("RFC822.HEADER"))
+	if err != nil {
+		return
+	}
 	textproto.ParseMessageHeader(msg, &m.Header)
-	textproto.ParseMessageStructure(msg, structure)
 
 	// Get message content
 
-	preferred := structure.GetPreferredPart()
-	cmd, _, err = wait(c.UIDFetch(seqset, "BODY.PEEK["+preferred.ID+"]"))
-	if err != nil {
+	path, part := getPreferredPart(data.BodyStructure)
+
+	ch = make(chan *imap.Message, 1)
+	if err = c.UidFetch(seqset, []string{"BODY.PEEK["+path+"]"}, ch); err != nil {
 		return
 	}
 
-	rsp = cmd.Data[0]
-	msgInfo = rsp.MessageInfo()
-	body := imap.AsBytes(msgInfo.Attrs["BODY["+preferred.ID+"]"])
+	data = <-ch
+	if data == nil {
+		err = errors.New("No such message body")
+		return
+	}
 
-	r := preferred.DecodeContent(bytes.NewReader(body))
-	slurp, err := ioutil.ReadAll(r)
+	r := decodePart(part, data.GetBody("BODY["+path+"]"))
+	b, err := ioutil.ReadAll(r)
 	if err != nil {
 		return
 	}
-	msg.Body = string(slurp)
+	msg.Body = string(b)
 
 	// Check if some attachments are encrypted
 
-	for _, att := range msg.Attachments {
+	/*for _, att := range msg.Attachments {
 		if att.MIMEType == "application/pgp" {
 			// TODO: get correct key packet length
 			// TODO: attachment is assumed to be base64-encoded
@@ -112,9 +115,9 @@ func (b *Messages) GetMessage(user, id string) (msg *backend.Message, err error)
 		}
 
 		att.ID = formatAttachmentId(mailbox, uid, att.ID)
-	}
+	}*/
 
-	tmpAtts, err := b.tmpAtts.ListAttachments(user, id)
+	tmpAtts, err := be.tmpAtts.ListAttachments(user, id)
 	if err == nil {
 		msg.Attachments = append(msg.Attachments, tmpAtts...)
 	}
@@ -154,7 +157,6 @@ func (b *Messages) ListMessages(user string, filter *backend.MessagesFilter) (ms
 	}
 
 	set, _ := imap.NewSeqSet("")
-	fetchUid := false
 	if filter.Limit > 0 && filter.Page >= 0 {
 		from := filter.Limit * filter.Page
 		to := filter.Limit * (filter.Page + 1)
@@ -169,91 +171,72 @@ func (b *Messages) ListMessages(user string, filter *backend.MessagesFilter) (ms
 	}
 
 	// TODO: support filter.Address, filter.Attachments
-	search := []imap.Field{}
+	criteria := &imap.SearchCriteria{}
+	search := false
 
-	dateFormat := "2-Jan-2006"
 	if filter.Begin != 0 {
-		search = append(search, "AFTER", time.Unix(filter.Begin, 0).Format(dateFormat))
+		criteria.Since = time.Unix(filter.Begin, 0)
+		search = true
 	}
 	if filter.End != 0 {
-		search = append(search, "BEFORE", time.Unix(filter.End, 0).Format(dateFormat))
+		criteria.Before = time.Unix(filter.End, 0)
+		search = true
 	}
 
 	if filter.From != "" {
-		search = append(search, "FROM", imap.Quote(filter.From, true))
+		criteria.From = filter.From
+		search = true
 	}
 	if filter.To != "" {
-		search = append(search, "TO", imap.Quote(filter.To, true))
+		criteria.To = filter.To
+		search = true
 	}
 
 	if filter.Keyword != "" {
-		search = append(search, "TEXT", imap.Quote(filter.Keyword, true))
+		criteria.Text = filter.Keyword
+		search = true
 	}
 
-	if len(search) > 0 {
-		var cmd *imap.Command
-		cmd, _, err = wait(c.UIDSearch(search...))
-		if err != nil {
+	fetchUid := false
+	if search {
+		var uids []uint32
+		if uids, err = c.UidSearch(criteria); err != nil {
 			return
 		}
 
-		results := []uint32{}
-		for _, res := range cmd.Data {
-			results = append(results, res.SearchResults()...)
-		}
-
-		if len(results) == 0 {
+		if len(uids) == 0 {
 			return // No result
 		}
 
 		set, _ = imap.NewSeqSet("")
-		set.AddNum(results...)
+		set.AddNum(uids...)
 		fetchUid = true
 	}
 
-	var cmd *imap.Command
-	if fetchUid {
-		cmd, err = c.UIDFetch(set, "UID", "FLAGS", "RFC822.SIZE", "ENVELOPE")
-		log.Println(cmd)
-		if err != nil {
-			return
+	items := []string{imap.UidMsgAttr, imap.FlagsMsgAttr, imap.SizeMsgAttr, imap.EnvelopeMsgAttr}
+
+	ch := make(chan *imap.Message)
+	done := make(chan error, 1)
+	go func() {
+		if fetchUid {
+			done <- c.UidFetch(set, items, ch)
+		} else {
+			done <- c.Fetch(set, items, ch)
 		}
-	} else {
-		cmd, err = c.Fetch(set, "UID", "FLAGS", "RFC822.SIZE", "ENVELOPE")
-		if err != nil {
-			return
-		}
+	}()
+
+	for data := range ch {
+		msg := &backend.Message{}
+		msg.ID = formatMessageId(c.Mailbox.Name, data.Uid)
+		msg.LabelIDs = []string{getLabelID(c.Mailbox.Name)}
+		parseMessage(msg, data)
+		parseEnvelope(msg, data.Envelope)
+
+		msgs = append(msgs, msg)
 	}
-
-	for cmd.InProgress() {
-		c.Recv(-1)
-
-		// Process command data
-		for _, rsp := range cmd.Data {
-			msgInfo := rsp.MessageInfo()
-			envelope := imap.AsList(msgInfo.Attrs["ENVELOPE"])
-
-			msg := &backend.Message{}
-			msg.ID = formatMessageId(c.Mailbox.Name, msgInfo.UID)
-			msg.LabelIDs = []string{getLabelID(c.Mailbox.Name)}
-			parseMessageInfo(msg, msgInfo)
-			parseEnvelope(msg, envelope)
-
-			tmpAtts, err := b.tmpAtts.ListAttachments(user, msg.ID)
-			if err == nil {
-				msg.Attachments = append(msg.Attachments, tmpAtts...)
-			}
-
-			msgs = append(msgs, msg)
-		}
-
-		cmd.Data = nil
-	}
-
-	c.Data = nil
 
 	// Check command completion status
-	if _, err = cmd.Result(imap.OK); err != nil {
+	if err = <-done; err != nil {
 		return
 	}
 
@@ -274,43 +257,41 @@ func (b *Messages) CountMessages(user string) (counts []*backend.MessagesCount, 
 	defer unlock()
 
 	for _, mailbox := range mailboxes {
-		cmd, _, err := wait(c.Status(mailbox.Name, "MESSAGES", "UNSEEN"))
+		status, err := c.Status(mailbox.Name, []string{imap.MailboxMessages, imap.MailboxUnseen})
 		if err != nil {
 			return nil, err
 		}
 
-		mailboxStatus := cmd.Data[0].MailboxStatus()
-
 		counts = append(counts, &backend.MessagesCount{
-			LabelID: getLabelID(mailboxStatus.Name),
-			Total:   int(mailboxStatus.Messages),
-			Unread:  int(mailboxStatus.Unseen),
+			LabelID: getLabelID(status.Name),
+			Total:   int(status.Messages),
+			Unread:  int(status.Unseen),
 		})
 	}
 
 	return
 }
 
-func (b *Messages) insertMessage(user, mailbox string, flags imap.FlagSet, mail []byte) (uid uint32, err error) {
-	literal := imap.NewLiteral(mail)
-
+func (b *Messages) insertMessage(user, mailbox string, flags []string, mail []byte) (uid uint32, err error) {
 	c, unlock, err := b.getConn(user)
 	if err != nil {
 		return
 	}
 	defer unlock()
 
-	_, res, err := wait(c.Append(mailbox, flags, nil, literal))
-	if err != nil {
+	t := time.Time{}
+	literal := bytes.NewBuffer(mail)
+	if err = c.Append(mailbox, flags, t, literal); err != nil {
 		return
 	}
 
-	if imap.AsString(res.Fields[0]) != "APPENDUID" {
+	/*if imap.AsString(res.Fields[0]) != "APPENDUID" {
 		err = errors.New("APPEND didn't returned an UID (this is not supported for now)")
 		return
 	}
 
-	uid = imap.AsNumber(res.Fields[2])
+	uid = imap.AsNumber(res.Fields[2])*/
+	uid = 0 // TODO
 	return
 }
 
@@ -320,7 +301,7 @@ func (b *Messages) InsertMessage(user string, msg *backend.Message) (inserted *b
 		return
 	}
 
-	flags := imap.NewFlagSet("\\Seen", "\\Draft")
+	flags := []string{"\\Seen", "\\Draft"}
 	mail := textproto.FormatMessage(msg)
 
 	uid, err := b.insertMessage(user, mailbox, flags, []byte(mail))
@@ -331,46 +312,34 @@ func (b *Messages) InsertMessage(user string, msg *backend.Message) (inserted *b
 }
 
 func (b *Messages) updateMessageFlags(user string, seqset *imap.SeqSet, flag string, value bool) error {
-	item := "+FLAGS"
-	if !value {
-		item = "-FLAGS"
-	}
-
-	fields := imap.Field([]imap.Field{imap.Field(flag)})
-
 	c, unlock, err := b.getConn(user)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	_, _, err = wait(c.UIDStore(seqset, item, fields))
-	if err != nil {
-		return err
+	item := imap.AddFlags
+	if !value {
+		item = imap.RemoveFlags
 	}
 
-	return nil
+	flags := []string{flag}
+	return c.UidStore(seqset, item, flags, nil)
 }
 
-func (b *Messages) deleteMessages(user string, seqset *imap.SeqSet) (err error) {
+func (b *Messages) deleteMessages(user string, seqset *imap.SeqSet) error {
 	c, unlock, err := b.getConn(user)
 	if err != nil {
-		return
+		return err
 	}
 	defer unlock()
 
-	fields := imap.Field([]imap.Field{imap.Field("\\Deleted")})
-	_, _, err = wait(c.UIDStore(seqset, "+FLAGS", fields))
-	if err != nil {
-		return
+	flags := []string{imap.DeletedFlag}
+	if err := c.UidStore(seqset, imap.AddFlags, flags, nil); err != nil {
+		return err
 	}
 
-	_, _, err = wait(c.Expunge(seqset))
-	if err != nil {
-		return
-	}
-
-	return
+	return c.Expunge(nil) // TODO: use UID EXPUNGE
 }
 
 // TODO: only supports moving one single message
@@ -381,17 +350,17 @@ func (b *Messages) copyMessages(user string, seqset *imap.SeqSet, mbox string) (
 	}
 	defer unlock()
 
-	_, res, err := wait(c.UIDCopy(seqset, mbox))
-	if err != nil {
+	if err = c.UidCopy(seqset, mbox); err != nil {
 		return
 	}
 
-	if imap.AsString(res.Fields[0]) != "COPYUID" {
+	/*if imap.AsString(res.Fields[0]) != "COPYUID" {
 		err = errors.New("COPY didn't returned an UID (this is not supported for now)")
 		return
 	}
 
-	uid = imap.AsNumber(res.Fields[2])
+	uid = imap.AsNumber(res.Fields[2])*/
+	uid = 0 // TODO
 	return
 }
 
@@ -429,21 +398,21 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 	update.Apply(msg)
 
 	if update.IsRead {
-		err = b.updateMessageFlags(user, seqset, "\\Seen", (update.Message.IsRead == 1))
+		err = b.updateMessageFlags(user, seqset, imap.SeenFlag, (update.Message.IsRead == 1))
 		if err != nil {
 			return
 		}
 	}
 
 	if update.Starred {
-		err = b.updateMessageFlags(user, seqset, "\\Flagged", (update.Message.Starred == 1))
+		err = b.updateMessageFlags(user, seqset, imap.FlaggedFlag, (update.Message.Starred == 1))
 		if err != nil {
 			return
 		}
 	}
 
 	if update.Type {
-		err = b.updateMessageFlags(user, seqset, "\\Draft", (update.Message.Type == backend.DraftType))
+		err = b.updateMessageFlags(user, seqset, imap.DraftFlag, (update.Message.Type == backend.DraftType))
 		if err != nil {
 			return
 		}
@@ -477,7 +446,7 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 			return
 		}
 
-		flags := imap.NewFlagSet("\\Seen")
+		flags := []string{imap.SeenFlag}
 		mail := textproto.FormatOutgoingMessage(outgoing)
 
 		var uid uint32

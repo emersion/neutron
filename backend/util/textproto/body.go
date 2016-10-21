@@ -4,8 +4,6 @@ import (
 	"io"
 	"strings"
 	"strconv"
-
-	"github.com/emersion/neutron/backend"
 )
 
 type BodyStructure struct {
@@ -46,63 +44,14 @@ func (s *BodyStructure) Get(id string) *BodyStructure {
 	return nil
 }
 
-func (s *BodyStructure) GetPreferredPart() (preferred *BodyStructure) {
-	preferred = s
-	for _, child := range s.Children {
-		if child.Type == "multipart" && child.SubType == "alternative" {
-			return child.GetPreferredPart()
-		}
-		if child.Type != "text" {
-			continue
-		}
-		if preferred.Type == "multipart" || child.SubType == "html" {
-			preferred = child
-		}
-	}
-	return
-}
-
-func (s *BodyStructure) DecodeContent(r io.Reader) io.Reader {
-	contentEncoding := s.ContentEncoding
-	if contentEncoding != "" {
-		r = decodeContentEncoding(r, contentEncoding)
+func Decode(r io.Reader, encoding, charset string) io.Reader {
+	if encoding != "" {
+		r = decodeContentEncoding(r, encoding)
 	}
 
-	charset := s.Params["charset"]
 	if charset != "" {
 		r = decodeCharset(r, charset)
 	}
 
-	s.Content = r
 	return r
-}
-
-func (s *BodyStructure) Attachment() *backend.Attachment {
-	return &backend.Attachment{
-		ID: s.ID,
-		Name: s.Params["name"],
-		MIMEType: s.Type + "/" + s.SubType,
-		Size: s.Size,
-	}
-}
-
-func ParseMessageStructure(msg *backend.Message, structure *BodyStructure) {
-	if structure.Type != "multipart" || structure.SubType == "alternative" {
-		return
-	}
-
-	for i, child := range structure.Children {
-		if child.Type == "multipart" {
-			ParseMessageStructure(msg, child)
-			continue
-		}
-
-		// AppleMail doesn't format well headers
-		// First child is message content
-		if child.Type == "text" && i == 0 {
-			continue
-		}
-
-		msg.Attachments = append(msg.Attachments, child.Attachment())
-	}
 }
