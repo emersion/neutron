@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/emersion/neutron/backend"
+	"github.com/emersion/go-imap-quota"
 )
 
 // IMAP backend cannot upate users, so when requesting to update it will just return silently.
@@ -14,41 +15,31 @@ type Users struct {
 	users map[string]*backend.User
 }
 
-func (b *Users) getQuota(user *backend.User) (err error) {
+func (b *Users) getQuota(user *backend.User) error {
 	c, unlock, err := b.getConn(user.ID)
 	if err != nil {
-		return
+		return err
 	}
 	defer unlock()
 
-	if !c.Caps["QUOTA"] {
-		// Quotas not supported on this server
+	if !c.SupportsQuota() {
 		return nil
 	}
 
-	cmd, _, err := wait(c.GetQuotaRoot("INBOX"))
+	quotas, err := c.GetQuotaRoot("INBOX")
 	if err != nil {
-		return
+		return err
 	}
 
 	// TODO: support multiple quotas?
-	for _, res := range cmd.Data {
-		if res.Label != "QUOTA" {
-			continue
+	if len(quotas) > 0 {
+		if usage, ok := quotas[0].Resources[quota.ResourceStorage]; ok {
+			user.UsedSpace = int(usage[0]) * 1024
+			user.MaxSpace = int(usage[1]) * 1024
 		}
-
-		_, quotas := res.Quota()
-		if len(quotas) == 0 {
-			continue
-		}
-		quota := quotas[0]
-
-		user.UsedSpace = int(quota.Usage) * 1024
-		user.MaxSpace = int(quota.Limit) * 1024
-		break
 	}
 
-	return
+	return nil
 }
 
 func (b *Users) GetUser(id string) (user *backend.User, err error) {
