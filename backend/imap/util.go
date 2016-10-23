@@ -83,22 +83,22 @@ func bodyStructureAttachments(structure *imap.BodyStructure) []*backend.Attachme
 
 	var attachments []*backend.Attachment
 	for i, part := range structure.Parts {
-		if part.Type == "multipart" {
-			parseBodyStructure(msg, part)
+		if part.MimeType == "multipart" {
+			attachments = append(attachments, bodyStructureAttachments(part)...)
 			continue
 		}
 
 		// Apple Mail doesn't format well headers
 		// First child is message content
-		if part.Type == "text" && i == 0 {
+		if part.MimeType == "text" && i == 0 {
 			continue
 		}
 
 		attachments = append(attachments, &backend.Attachment{
-			ID: s.Id,
-			Name: s.Params["name"],
-			MIMEType: s.MimeType + "/" + s.MimeSubType,
-			Size: int(s.Size),
+			ID: part.Id,
+			Name: part.Params["name"],
+			MIMEType: part.MimeType + "/" + part.MimeSubType,
+			Size: int(part.Size),
 		})
 	}
 
@@ -110,13 +110,13 @@ func getPreferredPart(structure *imap.BodyStructure) (path string, part *imap.Bo
 
 	for i, p := range structure.Parts {
 		if p.MimeType == "multipart" && p.MimeSubType == "alternative" {
-			part, path = getPreferredPart(p)
+			path, part = getPreferredPart(p)
 			path = strconv.Itoa(i+1) + "." + path
 		}
-		if p.Type != "text" {
+		if p.MimeType != "text" {
 			continue
 		}
-		if part.Type == "multipart" || p.SubType == "html" {
+		if part.MimeType == "multipart" || p.MimeSubType == "html" {
 			part = p
 			path = strconv.Itoa(i+1)
 		}
@@ -151,8 +151,8 @@ func parseEnvelope(msg *backend.Message, envelope *imap.Envelope) {
 
 	msg.Subject = envelope.Subject // textproto.DecodeWord()
 
-	if len(envelope.Senders) > 0 {
-		msg.Sender = parseAddress(envelope.Senders[0])
+	if len(envelope.Sender) > 0 {
+		msg.Sender = parseAddress(envelope.Sender[0])
 	}
 
 	if len(envelope.ReplyTo) > 0 {
