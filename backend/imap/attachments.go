@@ -1,12 +1,11 @@
 package imap
 
 import (
-	"bytes"
 	"errors"
 	"io/ioutil"
 
 	"github.com/emersion/neutron/backend"
-	"github.com/mxk/go-imap/imap"
+	"github.com/emersion/go-imap"
 )
 
 func (b *Messages) ListAttachments(user, msg string) ([]*backend.Attachment, error) {
@@ -41,19 +40,21 @@ func (b *Messages) ReadAttachment(user, id string) (att *backend.Attachment, out
 	seqset, _ := imap.NewSeqSet("")
 	seqset.AddNum(uid)
 
-	cmd, _, err := wait(c.UIDFetch(seqset, "BODYSTRUCTURE", "BODY.PEEK["+partId+"]"))
-	if err != nil {
+	items := []string{"BODY.PEEK["+partId+"]"}
+
+	messages := make(chan *imap.Message, 1)
+	if err = c.UidFetch(seqset, items, messages); err != nil {
 		return
 	}
 
-	rsp := cmd.Data[0]
-	msgInfo := rsp.MessageInfo()
-	structure := parseBodyStructure(imap.AsList(msgInfo.Attrs["BODYSTRUCTURE"]))
-	body := imap.AsBytes(msgInfo.Attrs["BODY["+partId+"]"])
+	data := <-messages
+	if data == nil {
+		err = errors.New("No such attachment (cannot find parent message)")
+		return
+	}
 
-	part := structure.Get(partId)
-	att = part.Attachment()
-	r := part.DecodeContent(bytes.NewReader(body))
+	att, r := parseAttachment(data.GetBody("BODY["+partId+"]"))
+
 	out, err = ioutil.ReadAll(r)
 	return
 }

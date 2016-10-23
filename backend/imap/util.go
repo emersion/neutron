@@ -1,14 +1,17 @@
 package imap
 
 import (
+	"bufio"
 	"encoding/base64"
 	"errors"
 	"io"
+	"mime"
+	"net/textproto"
 	"strconv"
 	"strings"
 
 	"github.com/emersion/neutron/backend"
-	"github.com/emersion/neutron/backend/util/textproto"
+	_textproto "github.com/emersion/neutron/backend/util/textproto"
 	"github.com/emersion/go-imap"
 )
 
@@ -126,12 +129,35 @@ func getPreferredPart(structure *imap.BodyStructure) (path string, part *imap.Bo
 }
 
 func decodePart(part *imap.BodyStructure, r io.Reader) io.Reader {
-	return textproto.Decode(r, part.Encoding, part.Params["charset"])
+	return _textproto.Decode(r, part.Encoding, part.Params["charset"])
+}
+
+func parseAttachment(r io.Reader) (att *backend.Attachment, body io.Reader) {
+	br := bufio.NewReader(r)
+	h, err := textproto.NewReader(br).ReadMIMEHeader()
+	if err != nil {
+		return
+	}
+
+	mediaType, params, _ := mime.ParseMediaType(h.Get("Content-Type"))
+
+	att = &backend.Attachment{
+		ID: h.Get("Content-Id"),
+		Name: params["name"],
+		MIMEType: mediaType,
+	}
+
+	if size := h.Get("Content-Size"); size != "" {
+		att.Size, _ = strconv.Atoi(size)
+	}
+
+	body = _textproto.Decode(br, h.Get("Content-Encoding"), params["charset"])
+	return
 }
 
 func parseAddress(addr *imap.Address) *backend.Email {
 	return &backend.Email{
-		Name:    textproto.DecodeWord(addr.PersonalName),
+		Name:    _textproto.DecodeWord(addr.PersonalName),
 		Address: addr.MailboxName + "@" + addr.HostName,
 	}
 }
@@ -149,7 +175,7 @@ func parseEnvelope(msg *backend.Message, envelope *imap.Envelope) {
 		msg.Time = envelope.Date.Unix()
 	}
 
-	msg.Subject = envelope.Subject // textproto.DecodeWord()
+	msg.Subject = envelope.Subject // _textproto.DecodeWord()
 
 	if len(envelope.Sender) > 0 {
 		msg.Sender = parseAddress(envelope.Sender[0])
