@@ -22,7 +22,9 @@ func (b *Users) getQuota(user *backend.User) error {
 	}
 	defer unlock()
 
-	if !c.SupportsQuota() {
+	if ok, err := c.SupportQuota(); err != nil {
+		return err
+	} else if !ok {
 		return nil
 	}
 

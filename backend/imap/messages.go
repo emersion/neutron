@@ -171,7 +171,7 @@ func (b *Messages) ListMessages(user string, filter *backend.MessagesFilter) (ms
 	}
 
 	// TODO: support filter.Address, filter.Attachments
-	criteria := &imap.SearchCriteria{}
+	criteria := imap.NewSearchCriteria()
 	search := false
 
 	if filter.Begin != 0 {
@@ -184,16 +184,16 @@ func (b *Messages) ListMessages(user string, filter *backend.MessagesFilter) (ms
 	}
 
 	if filter.From != "" {
-		criteria.From = filter.From
+		criteria.Header.Set("From", filter.From)
 		search = true
 	}
 	if filter.To != "" {
-		criteria.To = filter.To
+		criteria.Header.Set("To", filter.To)
 		search = true
 	}
 
 	if filter.Keyword != "" {
-		criteria.Text = filter.Keyword
+		criteria.Text = []string{filter.Keyword}
 		search = true
 	}
 
@@ -208,7 +208,7 @@ func (b *Messages) ListMessages(user string, filter *backend.MessagesFilter) (ms
 			return // No result
 		}
 
-		set, _ = imap.NewSeqSet("")
+		set = new(imap.SeqSet)
 		set.AddNum(uids...)
 		fetchUid = true
 	}
