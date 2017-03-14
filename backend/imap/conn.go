@@ -158,13 +158,14 @@ func (b *conns) idle(clt *client) error {
 	}
 
 	clt.lock.Lock()
-	defer clt.lock.Unlock()
 
 	done := make(chan error, 1)
 	clt.idle = make(chan struct{})
 	go func() {
 		done <- c.Idle(clt.idle)
 	}()
+
+	clt.lock.Unlock()
 
 	reset := time.After(20 * time.Minute)
 
@@ -194,10 +195,13 @@ func (b *conns) idle(clt *client) error {
 			}
 		//case msg := <-c.MessageUpdates:
 		case <-reset:
+			clt.lock.Lock()
 			// Reset idle (RFC 2177 recommends 29 min max)
 			if err := b.cancelIdle(clt); err != nil {
+				clt.lock.Unlock()
 				return err
 			}
+			clt.lock.Unlock()
 
 			return b.idle(clt)
 		case err := <-done:
