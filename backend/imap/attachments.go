@@ -53,7 +53,11 @@ func (b *Messages) ReadAttachment(user, id string) (att *backend.Attachment, out
 		return
 	}
 
-	att, r := parseAttachment(data.GetBody("BODY["+partId+"]"))
+	// TODO: get part WITH header
+	att, r, err := parseAttachment(data.GetBody("BODY["+partId+"]"))
+	if err != nil {
+		return
+	}
 
 	out, err = ioutil.ReadAll(r)
 	return

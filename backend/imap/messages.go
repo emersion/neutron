@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"io/ioutil"
-	"net/mail"
 	"time"
 
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/mail"
 
 	"github.com/emersion/neutron/backend"
 	"github.com/emersion/neutron/backend/memory"
-	"github.com/emersion/neutron/backend/util/textproto"
 )
 
 type updatableAttachments interface {
@@ -67,16 +67,16 @@ func (be *Messages) GetMessage(user, id string) (msg *backend.Message, err error
 	// Apply body structure to msg
 	msg.Attachments = bodyStructureAttachments(data.BodyStructure)
 
-	// Apply header to msg
-	m, err := mail.ReadMessage(data.GetBody("RFC822.HEADER"))
+	// Read message header
+	mr, err := mail.CreateReader(data.GetBody("RFC822.HEADER"))
 	if err != nil {
 		return
 	}
-	textproto.ParseMessageHeader(msg, &m.Header)
+	parseMessageHeader(msg, mr.Header)
 
 	// Get message content
 
-	path, part := getPreferredPart(data.BodyStructure)
+	path, _ := getPreferredPart(data.BodyStructure)
 
 	ch = make(chan *imap.Message, 1)
 	if err = c.UidFetch(seqset, []string{"BODY.PEEK["+path+"]"}, ch); err != nil {
@@ -89,8 +89,13 @@ func (be *Messages) GetMessage(user, id string) (msg *backend.Message, err error
 		return
 	}
 
-	r := decodePart(part, data.GetBody("BODY["+path+"]"))
-	b, err := ioutil.ReadAll(r)
+	// TODO: get part WITH header
+	e, err := message.Read(data.GetBody("BODY["+path+"]"))
+	if err != nil {
+		return
+	}
+
+	b, err := ioutil.ReadAll(e.Body)
 	if err != nil {
 		return
 	}
@@ -295,20 +300,27 @@ func (b *Messages) insertMessage(user, mailbox string, flags []string, mail []by
 	return
 }
 
-func (b *Messages) InsertMessage(user string, msg *backend.Message) (inserted *backend.Message, err error) {
-	mailbox, err := b.getLabelMailbox(user, backend.DraftLabel)
+func (be *Messages) InsertMessage(user string, msg *backend.Message) (*backend.Message, error) {
+	mailbox, err := be.getLabelMailbox(user, backend.DraftLabel)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	flags := []string{"\\Seen", "\\Draft"}
-	mail := textproto.FormatMessage(msg)
 
-	uid, err := b.insertMessage(user, mailbox, flags, []byte(mail))
+	var b bytes.Buffer
+	if err := writeMessage(&b, msg); err != nil {
+		return nil, err
+	}
 
-	inserted = msg
+	uid, err := be.insertMessage(user, mailbox, flags, b.Bytes())
+	if err != nil {
+		return nil, err
+	}
+
+	inserted := msg
 	inserted.ID = formatMessageId(mailbox, uid)
-	return
+	return inserted, nil
 }
 
 func (b *Messages) updateMessageFlags(user string, seqset *imap.SeqSet, flag string, value bool) error {
@@ -374,14 +386,14 @@ func (b *Messages) moveMessages(user string, seqset *imap.SeqSet, mbox string) (
 	return
 }
 
-func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (msg *backend.Message, err error) {
+func (be *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (msg *backend.Message, err error) {
 	// Retrieve message from mailbox
 	mailbox, uid, err := parseMessageId(update.Message.ID)
 	if err != nil {
 		return
 	}
 
-	err = b.selectMailbox(user, mailbox)
+	err = be.selectMailbox(user, mailbox)
 	if err != nil {
 		return
 	}
@@ -389,7 +401,7 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uid)
 
-	msg, err = b.GetMessage(user, update.Message.ID)
+	msg, err = be.GetMessage(user, update.Message.ID)
 	if err != nil {
 		return
 	}
@@ -398,21 +410,21 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 	update.Apply(msg)
 
 	if update.IsRead {
-		err = b.updateMessageFlags(user, seqset, imap.SeenFlag, (update.Message.IsRead == 1))
+		err = be.updateMessageFlags(user, seqset, imap.SeenFlag, (update.Message.IsRead == 1))
 		if err != nil {
 			return
 		}
 	}
 
 	if update.Starred {
-		err = b.updateMessageFlags(user, seqset, imap.FlaggedFlag, (update.Message.Starred == 1))
+		err = be.updateMessageFlags(user, seqset, imap.FlaggedFlag, (update.Message.Starred == 1))
 		if err != nil {
 			return
 		}
 	}
 
 	if update.Type {
-		err = b.updateMessageFlags(user, seqset, imap.DraftFlag, (update.Message.Type == backend.DraftType))
+		err = be.updateMessageFlags(user, seqset, imap.DraftFlag, (update.Message.Type == backend.DraftType))
 		if err != nil {
 			return
 		}
@@ -422,7 +434,7 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 	// Correctly handle temporary attachments
 	if update.Type && update.Message.Type == backend.SentType {
 		// Retrieve temporary attachments
-		tmpAtts, _ := b.tmpAtts.ListAttachments(user, update.Message.ID)
+		tmpAtts, _ := be.tmpAtts.ListAttachments(user, update.Message.ID)
 
 		// Insert temporary attachments to message and send it to the server
 
@@ -432,7 +444,7 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 
 		for _, att := range tmpAtts {
 			var d []byte
-			att, d, err = b.tmpAtts.ReadAttachment(user, att.ID)
+			att, d, err = be.tmpAtts.ReadAttachment(user, att.ID)
 
 			outgoing.Attachments = append(outgoing.Attachments, &backend.OutgoingAttachment{
 				Attachment: att,
@@ -441,16 +453,20 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 		}
 
 		var mailbox string
-		mailbox, err = b.getLabelMailbox(user, backend.SentLabel)
+		mailbox, err = be.getLabelMailbox(user, backend.SentLabel)
 		if err != nil {
 			return
 		}
 
 		flags := []string{imap.SeenFlag}
-		mail := textproto.FormatOutgoingMessage(outgoing)
+
+		var b bytes.Buffer
+		if err = writeOutgoingMessage(&b, outgoing); err != nil {
+			return
+		}
 
 		var uid uint32
-		uid, err = b.insertMessage(user, mailbox, flags, []byte(mail))
+		uid, err = be.insertMessage(user, mailbox, flags, b.Bytes())
 		if err != nil {
 			return
 		}
@@ -459,7 +475,7 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 
 		// Remove temporary attachments
 		for _, att := range tmpAtts {
-			b.tmpAtts.DeleteAttachment(user, att.ID)
+			be.tmpAtts.DeleteAttachment(user, att.ID)
 		}
 	} else if update.ToList || update.CCList || update.BCCList || update.Subject || update.AddressID || update.Body || update.Time {
 		// If one of those is modified, we have to re-send the whole message to the server
@@ -469,21 +485,21 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 		msg.ID = "" // Will be overwritten
 
 		// Insert the updated message
-		msg, err = b.InsertMessage(user, msg)
+		msg, err = be.InsertMessage(user, msg)
 		if err != nil {
 			return
 		}
 
 		// Delete the old message
-		err = b.deleteMessages(user, seqset)
+		err = be.deleteMessages(user, seqset)
 		if err != nil {
 			return
 		}
 
 		// Update temporary attachments message ID
-		tmpAtts, _ := b.tmpAtts.ListAttachments(user, oldId)
+		tmpAtts, _ := be.tmpAtts.ListAttachments(user, oldId)
 		for _, att := range tmpAtts {
-			b.tmpAtts.UpdateAttachmentMessage(user, att.ID, msg.ID)
+			be.tmpAtts.UpdateAttachmentMessage(user, att.ID, msg.ID)
 		}
 	} else if update.LabelIDs != backend.RemoveLabels && len(update.Message.LabelIDs) == 1 {
 		// Move the message from its mailbox to another one
@@ -493,13 +509,13 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 		label := msg.LabelIDs[0]
 
 		var newMailbox string
-		newMailbox, err = b.getLabelMailbox(user, label)
+		newMailbox, err = be.getLabelMailbox(user, label)
 		if err != nil {
 			return
 		}
 
 		var newUid uint32
-		newUid, err = b.moveMessages(user, seqset, newMailbox)
+		newUid, err = be.moveMessages(user, seqset, newMailbox)
 		if err != nil {
 			return
 		}
@@ -509,9 +525,9 @@ func (b *Messages) UpdateMessage(user string, update *backend.MessageUpdate) (ms
 		msg.ID = formatMessageId(newMailbox, newUid)
 
 		// Update temporary attachments message ID
-		tmpAtts, _ := b.tmpAtts.ListAttachments(user, oldId)
+		tmpAtts, _ := be.tmpAtts.ListAttachments(user, oldId)
 		for _, att := range tmpAtts {
-			b.tmpAtts.UpdateAttachmentMessage(user, att.ID, msg.ID)
+			be.tmpAtts.UpdateAttachmentMessage(user, att.ID, msg.ID)
 		}
 	}
 

@@ -1,19 +1,23 @@
 package imap
 
 import (
-	"bufio"
 	"encoding/base64"
 	"errors"
 	"io"
-	"mime"
-	"net/textproto"
 	"strconv"
 	"strings"
 
-	"github.com/emersion/neutron/backend"
-	_textproto "github.com/emersion/neutron/backend/util/textproto"
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/charset"
+	"github.com/emersion/go-message/mail"
+
+	"github.com/emersion/neutron/backend"
 )
+
+func init() {
+	imap.CharsetReader = charset.Reader
+}
 
 func formatAttachmentId(mailbox string, uid uint32, part string) string {
 	raw := mailbox + "/" + strconv.Itoa(int(uid))
@@ -78,6 +82,81 @@ func parseMessage(msg *backend.Message, src *imap.Message) {
 	}
 }
 
+func writeMessage(w io.Writer, msg *backend.Message) error {
+	h := mail.NewHeader()
+
+	mw, err := mail.CreateWriter(w, h)
+	if err != nil {
+		return err
+	}
+	defer mw.Close()
+
+	th := mail.NewTextHeader()
+	th.SetContentType("text/html", map[string]string{"charset": "utf-8"})
+	tw, err := mw.CreateSingleText(th)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(tw, msg.Body); err != nil {
+		return err
+	}
+	tw.Close()
+
+	return nil
+}
+
+func writeOutgoingMessage(w io.Writer, msg *backend.OutgoingMessage) error {
+	h := mail.NewHeader()
+
+	mw, err := mail.CreateWriter(w, h)
+	if err != nil {
+		return err
+	}
+	defer mw.Close()
+
+	th := mail.NewTextHeader()
+	th.SetContentType("text/html", map[string]string{"charset": "utf-8"})
+	tw, err := mw.CreateSingleText(th)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(tw, msg.Message.Body); err != nil {
+		return err
+	}
+	tw.Close()
+
+	for _, att := range msg.Attachments {
+		mimeType := att.MIMEType
+		if att.KeyPackets != "" {
+			mimeType = "application/pgp"
+		}
+
+		ah := mail.NewAttachmentHeader()
+		ah.SetContentType(mimeType, map[string]string{"name": att.Name})
+		aw, err := mw.CreateAttachment(ah)
+		if err != nil {
+			return err
+		}
+
+		if att.KeyPackets != "" {
+			kp, err := base64.StdEncoding.DecodeString(att.KeyPackets)
+			if err != nil {
+				return err
+			}
+			if _, err := aw.Write(kp); err != nil {
+				return err
+			}
+		}
+
+		if _, err := aw.Write(att.Data); err != nil {
+			return err
+		}
+		aw.Close()
+	}
+
+	return nil
+}
+
 func bodyStructureAttachments(structure *imap.BodyStructure) []*backend.Attachment {
 	// Non-multipart messages don't contain attachments
 	if structure.MimeType != "multipart" || structure.MimeSubType == "alternative" {
@@ -91,7 +170,7 @@ func bodyStructureAttachments(structure *imap.BodyStructure) []*backend.Attachme
 			continue
 		}
 
-		// Apple Mail doesn't format well headers
+		// Apple Mail doesn't format well header fields
 		// First child is message content
 		if part.MimeType == "text" && i == 0 {
 			continue
@@ -128,37 +207,41 @@ func getPreferredPart(structure *imap.BodyStructure) (path string, part *imap.Bo
 	return
 }
 
-func decodePart(part *imap.BodyStructure, r io.Reader) io.Reader {
-	return _textproto.Decode(r, part.Encoding, part.Params["charset"])
-}
-
-func parseAttachment(r io.Reader) (att *backend.Attachment, body io.Reader) {
-	br := bufio.NewReader(r)
-	h, err := textproto.NewReader(br).ReadMIMEHeader()
+func parseAttachment(r io.Reader) (att *backend.Attachment, body io.Reader, err error) {
+	e, err := message.Read(r)
 	if err != nil {
 		return
 	}
 
-	mediaType, params, _ := mime.ParseMediaType(h.Get("Content-Type"))
+	h := mail.AttachmentHeader{e.Header}
 
-	att = &backend.Attachment{
-		ID: h.Get("Content-Id"),
-		Name: params["name"],
-		MIMEType: mediaType,
+	att = &backend.Attachment{ID: h.Get("Content-Id")}
+	body = e.Body
+
+	if t, _, err := h.ContentType(); err == nil {
+		att.MIMEType = t
 	}
-
+	if name, err := h.Filename(); err == nil {
+		att.Name = name
+	}
 	if size := h.Get("Content-Size"); size != "" {
 		att.Size, _ = strconv.Atoi(size)
 	}
 
-	body = _textproto.Decode(br, h.Get("Content-Encoding"), params["charset"])
 	return
 }
 
 func parseAddress(addr *imap.Address) *backend.Email {
 	return &backend.Email{
-		Name:    _textproto.DecodeWord(addr.PersonalName),
+		Name:    addr.PersonalName,
 		Address: addr.MailboxName + "@" + addr.HostName,
+	}
+}
+
+func parseMailAddress(addr *mail.Address) *backend.Email {
+	return &backend.Email{
+		Name:    addr.Name,
+		Address: addr.Address,
 	}
 }
 
@@ -170,12 +253,20 @@ func parseAddressList(list []*imap.Address) []*backend.Email {
 	return emails
 }
 
+func parseMailAddressList(list []*mail.Address) []*backend.Email {
+	emails := make([]*backend.Email, len(list))
+	for i, addr := range list {
+		emails[i] = parseMailAddress(addr)
+	}
+	return emails
+}
+
 func parseEnvelope(msg *backend.Message, envelope *imap.Envelope) {
 	if !envelope.Date.IsZero() {
 		msg.Time = envelope.Date.Unix()
 	}
 
-	msg.Subject = envelope.Subject // _textproto.DecodeWord()
+	msg.Subject = envelope.Subject
 
 	if len(envelope.Sender) > 0 {
 		msg.Sender = parseAddress(envelope.Sender[0])
@@ -188,4 +279,26 @@ func parseEnvelope(msg *backend.Message, envelope *imap.Envelope) {
 	msg.ToList = parseAddressList(envelope.To)
 	msg.CCList = parseAddressList(envelope.Cc)
 	msg.BCCList = parseAddressList(envelope.Bcc)
+}
+
+func parseMessageHeader(msg *backend.Message, h mail.Header) {
+	msg.Subject, _ = h.Subject()
+	if from, err := h.AddressList("From"); err == nil && len(from) > 0 {
+		msg.Sender = parseMailAddress(from[0])
+	}
+	if to, err := h.AddressList("To"); err == nil {
+		msg.ToList = parseMailAddressList(to)
+	}
+	if cc, err := h.AddressList("Cc"); err == nil {
+		msg.CCList = parseMailAddressList(cc)
+	}
+	if bcc, err := h.AddressList("Bcc"); err == nil {
+		msg.BCCList = parseMailAddressList(bcc)
+	}
+	if replyTo, err := h.AddressList("Reply-To"); err == nil && len(replyTo) > 0 {
+		msg.ReplyTo = parseMailAddress(replyTo[0])
+	}
+	if t, err := h.Date(); err == nil {
+		msg.Time = t.Unix()
+	}
 }
